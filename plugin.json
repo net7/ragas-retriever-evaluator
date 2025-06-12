@@ -1,10 +1,10 @@
 {
-    "name": "My plugin",
+    "name": "Ragas Retriever Evaluator",
     "version": "0.0.1",
-    "description": "Description of my_plugin.",
-    "author_name": "Me",
-    "author_url": "https://mywebsite.me",
-    "plugin_url": "https://github.com/my_name/my_plugin",
-    "tags": "cat, template, example",
-    "thumb": "https://raw.githubusercontent.com/my_repo_path/my_plugin.png"
+    "description": "A plugin to evaluate the retriever performance of the Cheshire Cat using Ragas. This plugin provides a tool to run evaluations based on a dataset and measure context precision and recall.",
+    "author_name": "Net7",
+    "author_url": "https://www.netseven.it/",
+    "plugin_url": "https://github.com/net7/ragas-retriever-evaluator",
+    "tags": "ragas, evaluation, retriever, metrics",
+    "thumb": "https://raw.githubusercontent.com/net7/ragas-retriever-evaluator/main/logo.jpg"
 }
