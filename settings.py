@@ -42,6 +42,11 @@ class RagasEvaluatorSettings(BaseModel):
         description="The number of documents (k) to retrieve from declarative memory for each question.",
         ge=1
     )
+    generation_prompt_template: str = Field(
+        default="Based *only* on the following context, answer the question. Do not use any other information.\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:",
+        title="Generation Prompt Template",
+        description="Template for generating answers during evaluation. Use {context} and {question} as placeholders. Keep the constraint for faithful evaluation."
+    )
 
 @plugin
 def settings_model():

@@ -1,21 +1,27 @@
 """
-This plugin provides a tool to evaluate the retriever component of a RAG system.
+This plugin provides tools to evaluate the retriever and generator components of a RAG system using the Ragas framework.
 
-It focuses exclusively on the quality of the retrieved chunks, using the Ragas
-metrics `ContextPrecision` and `ContextRecall`.
+It offers two separate evaluations:
+1.  **Retriever Evaluation**: Measures the quality of the retrieved context using:
+    - `ContextPrecision`: How relevant is the retrieved context?
+    - `ContextRecall`: Does the context contain enough information to answer the question?
 
-- `ContextPrecision`: Measures the relevance of the retrieved chunks.
-  (How many of the retrieved chunks are actually relevant?)
-- `ContextRecall`: Measures the informational completeness of the retrieved chunks.
-  (Do the retrieved chunks contain enough information to answer the question?)
+2.  **Generator Evaluation**: Measures the quality of the generated answer using:
+    - `Faithfulness`: Is the answer factually consistent with the context?
+    - `ResponseRelevancy`: Is the answer relevant to the question?
 
-The plugin reads a dataset file from a public URL (e.g. a Google Sheet link) which must contain:
+Each evaluation is run via a dedicated tool, using a dataset from a public URL (e.g., a Google Sheet).
+The plugin reads a dataset file from a public URL (e.g. a Google Sheet link).
+For the retriever evaluation, the dataset must contain:
 - `question`: The user's query.
 - `ground_truth_contexts`: A list of reference chunks (ground truth) for precision.
 - `ground_truth`: The ideal answer based on the ground truth contexts, for recall.
 
-The configuration for the judge LLM and other parameters is read from the plugin's settings.
-The `contexts` are retrieved dynamically by querying the Cat's declarative memory for each question.
+For the generator evaluation, the dataset only needs the `question` column.
+The configuration for the judge LLM, retrieval parameters, and generation prompt template 
+is read from the plugin's settings. The `contexts` are retrieved dynamically by querying 
+the Cat's declarative memory for each question, and the `answer` is generated on the fly 
+using a configurable prompt template.
 """
 import os
 import pandas as pd
@@ -227,8 +233,8 @@ def evaluate_retriever(dataset_url: str = None, *, cat: StrayCat) -> str:
             response = requests.get(path_or_url, headers=headers)
             response.raise_for_status()  # This will raise an HTTPError for bad responses (4xx or 5xx)
 
-            # Read the CSV data from the response content
-            df = pd.read_csv(io.StringIO(response.text))
+            # Read the CSV data from the response content, explicitly decoding as UTF-8
+            df = pd.read_csv(io.StringIO(response.content.decode('utf-8')))
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 # Provide user-friendly instructions for the most common error (private sheet)
@@ -363,4 +369,237 @@ def evaluate_retriever(dataset_url: str = None, *, cat: StrayCat) -> str:
 
     except Exception as e:
         log.error(f"An unexpected error occurred during retriever evaluation: {e}")
+        return f"An error occurred during evaluation. Check the logs for details. Error: {e}" 
+
+
+@tool(
+    return_direct=True,
+    examples=[
+        # Start evaluation without a URL
+        "run a generator evaluation",
+        "evaluate the generator",
+        "start ragas generator evaluation",
+        # Explicit, verbose commands
+        "Run a generator evaluation using this dataset: https://docs.google.com/spreadsheets/d/example/edit",
+        "Can you evaluate the generator with this spreadsheet? https://example.com/data.csv",
+        # Shorter, more natural commands
+        "evaluate generator with this sheet: https://docs.google.com/spreadsheets/d/another-example/edit",
+        "run ragas generator on this: https://example.com/data.csv",
+    ],
+)
+def evaluate_generator(dataset_url: str = None, *, cat: StrayCat) -> str:
+    """
+    Evaluates the generator's performance using a dataset from a public URL.
+
+    This tool focuses on the generation part of the RAG pipeline, measuring:
+    - `Faithfulness`: Whether the answer is factually consistent with the retrieved context.
+    - `ResponseRelevancy`: Whether the answer is relevant to the question.
+
+    The tool orchestrates the evaluation by:
+    1.  Reading a dataset with `question`s from the provided URL.
+    2.  For each question:
+        a. Dynamically retrieving context from the Cat's memory.
+        b. Generating an answer based on the retrieved context.
+    3.  Running Ragas metrics to evaluate the generated answers.
+    4.  Displaying the results directly in the chat.
+
+    If a URL is not provided, the tool will ask the user for one.
+
+    The dataset must be a publicly accessible CSV file or Google Sheet and MUST contain
+    the following column:
+    - `question`: The user's query.
+
+    Args:
+        dataset_url (str, optional): The public URL of the CSV dataset. Defaults to None.
+        cat (StrayCat): The Cheshire Cat instance (injected by the framework).
+    """
+    if not dataset_url:
+        return t(
+            (
+                "**Sure, let's start the generator evaluation!**\n\n"
+                "To proceed, I need you to provide a public link to a CSV file or a Google Sheet. "
+                "The file must contain the column `question`.\n\n"
+                "You can paste the link here."
+            ),
+            cat
+        )
+
+    try:
+        # MONKEY-PATCH: Prevent nest_asyncio from patching the uvloop.
+        import nest_asyncio
+        nest_asyncio.apply = lambda: None
+
+        # Defer imports to avoid import-time side effects with asyncio loops.
+        from datasets import Dataset
+        from ragas import evaluate
+        from langchain_openai import ChatOpenAI
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from ragas.metrics import (
+            Faithfulness,
+            ResponseRelevancy,
+        )
+
+        # Load settings from the plugin's configuration
+        settings = cat.mad_hatter.get_plugin().load_settings()
+        openai_api_key = settings.get("openai_api_key")
+        judge_model = settings.get("judge_model", "gpt-3.5-turbo")
+        judge_temperature = float(settings.get("judge_temperature", 0.0))
+        k = int(settings.get("retrieval_k", 5))
+        prompt_template = settings.get("generation_prompt_template", 
+            "Based *only* on the following context, answer the question. Do not use any other information.\n\nContext:\n{context}\n\nQuestion: {question}\n\nAnswer:")
+
+        if not openai_api_key:
+            return "Error: OpenAI API Key for the judge model is not configured. Please go to the Ragas Retriever Evaluator plugin settings and add your key."
+
+        os.environ["OPENAI_API_KEY"] = openai_api_key
+
+        cat.send_ws_message(f"Starting GENERATOR evaluation with Ragas...\nDataset: {dataset_url}\nJudge Model: {judge_model}, k: {k}", "notification")
+
+        path_or_url = dataset_url
+        if not path_or_url.startswith("http"):
+             return "Error: Please provide a valid public URL, not a local path."
+
+        if "docs.google.com/spreadsheets" in path_or_url:
+            match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)/edit", path_or_url)
+            if match:
+                sheet_id = match.group(1)
+                path_or_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+                log.info(f"Standard Google Sheet URL detected. Converting to export URL: {path_or_url}")
+            else:
+                log.info("Published or other Google Sheet URL detected. Using as is.")
+
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
+            }
+            response = requests.get(path_or_url, headers=headers)
+            response.raise_for_status()
+            df = pd.read_csv(io.StringIO(response.content.decode('utf-8')))
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                error_message_en = (
+                    "**Error: Access Denied to Google Sheet (401 Unauthorized)**\n\n"
+                    "It seems the file is not public. To fix this, please change the sharing settings:\n\n"
+                    "1.  **Open your Google Sheet**.\n"
+                    "2.  Click on **Share** (top right).\n"
+                    "3.  Under **General access**, change from `Restricted` to **`Anyone with the link`**.\n"
+                    "4.  Ensure the role is **Viewer**.\n\n"
+                    "After updating the settings, please try sending the command again."
+                )
+                error_message = t(error_message_en, cat)
+                log.error(f"Access denied to Google Sheet at {dataset_url} (401). It is likely not public.")
+            elif e.response.status_code == 404:
+                error_message_en = "**Error: File Not Found (404 Not Found)**\n\n" \
+                                   "The provided URL was not found: `{dataset_url}`. Please check that it is correct and try again."
+                error_message = t(error_message_en, cat, dataset_url=dataset_url)
+                log.error(f"Dataset not found at {dataset_url} (404).")
+            else:
+                error_message_en = "Error: Could not read the dataset from '{dataset_url}'. The server returned an error: {e}. Please ensure the URL is correct and publicly accessible."
+                error_message = t(error_message_en, cat, dataset_url=dataset_url, e=e)
+                log.error(f"HTTP Error when fetching dataset from {dataset_url}: {e}")
+            
+            return error_message
+        except Exception as e:
+            error_message = f"Error: Could not process the dataset from '{dataset_url}'. Please check the URL and file format. Details: {e}"
+            log.error(error_message)
+            return error_message
+
+        # Basic validation
+        required_columns = ["question"]
+        if not all(col in df.columns for col in required_columns):
+            error_message = f"Error: The dataset must contain the following column: {', '.join(required_columns)}."
+            log.error(error_message)
+            return error_message
+
+        df.dropna(subset=["question"], inplace=True)
+        
+        # Dynamically retrieve contexts and generate answers
+        retrieved_contexts = []
+        generated_answers = []
+        for idx, row in df.iterrows():
+            question = row["question"]
+            log.info(f"Processing question for generator evaluation: '{question}'")
+            try:
+                # 1. Retrieve contexts from memory
+                embedding = cat.embedder.embed_query(question)
+                recalled_docs = cat.memory.vectors.declarative.recall_memories_from_embedding(embedding, k=k)
+                contexts = [doc[0].page_content for doc in recalled_docs]
+                retrieved_contexts.append(contexts)
+
+                # 2. Generate an answer based on the contexts
+                context_str = "\n".join(contexts)
+                prompt = prompt_template.format(context=context_str, question=question)
+                answer = cat.llm(prompt)
+                generated_answers.append(answer)
+
+            except Exception as e:
+                log.error(f"Failed to retrieve context or generate answer for question '{question}': {e}")
+                retrieved_contexts.append([])
+                generated_answers.append("") # Append empty strings on error
+
+        df["contexts"] = retrieved_contexts
+        df["answer"] = generated_answers
+
+        # Prepare dataset for Ragas
+        dataset = Dataset.from_pandas(df)
+
+        # Set up Ragas metrics
+        langchain_llm = ChatOpenAI(
+            model=judge_model,
+            temperature=judge_temperature
+        )
+        judging_llm = LangchainLLMWrapper(langchain_llm)
+
+        # Wrap the Cat's embedder for Ragas
+        embedder = LangchainEmbeddingsWrapper(cat.embedder.langchain_embeddings)
+
+        metrics_to_evaluate = [
+            Faithfulness(llm=judging_llm),
+            ResponseRelevancy(llm=judging_llm, embeddings=embedder),
+        ]
+
+        cat.send_ws_message("Running evaluation...", "notification")
+        result = evaluate(
+            dataset=dataset,
+            metrics=metrics_to_evaluate,
+        )
+        cat.send_ws_message("Evaluation completed.", "notification")
+
+        result_scores_df = result.to_pandas()
+        df.reset_index(drop=True, inplace=True)
+        result_scores_df.reset_index(drop=True, inplace=True)
+        detailed_df = pd.concat([df, result_scores_df], axis=1)
+
+        summary_lines = [
+            f"- **Faithfulness:** {np.nanmean(result['faithfulness']):.3f}",
+            f"- **Answer Relevancy:** {np.nanmean(result['answer_relevancy']):.3f}"
+        ]
+        summary_str = "\n".join(summary_lines)
+
+        log.info(f"Ragas Generator Evaluation Results (Summary):\n{summary_str}")
+
+        # --- Create Markdown table for chat display ---
+        display_df = detailed_df[["question", "faithfulness", "answer_relevancy"]].copy()
+        display_df.rename(columns={
+            "question": "Question",
+            "faithfulness": "Faithfulness",
+            "answer_relevancy": "Answer Relevancy"
+        }, inplace=True)
+        
+        display_df["Question"] = display_df["Question"].apply(lambda x: (x[:50] + '...') if len(x) > 53 else x)
+        
+        detailed_markdown_table = display_df.to_markdown(index=False, floatfmt=".3f")
+
+        log.info(f"Detailed Ragas generator evaluation report (not saved):\n{detailed_df.to_string()}")
+
+        header = t("**Generator Evaluation Summary:**", cat)
+        subheader = t("### Detailed Scores per Question:", cat)
+        
+        final_message = f"{header}\n\n{summary_str}\n\n{subheader}\n{detailed_markdown_table}"
+        
+        return final_message
+
+    except Exception as e:
+        log.error(f"An unexpected error occurred during generator evaluation: {e}")
         return f"An error occurred during evaluation. Check the logs for details. Error: {e}" 
