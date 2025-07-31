@@ -1,6 +1,6 @@
 {
     "name": "Ragas Retriever Evaluator",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "A comprehensive plugin to evaluate both retriever and generator components of the Cheshire Cat using Ragas. Provides tools to measure context precision/recall and answer faithfulness/relevancy with configurable prompt templates.",
     "author_name": "Net7",
     "author_url": "https://www.netseven.it/",

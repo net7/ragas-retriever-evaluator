@@ -552,7 +552,7 @@ def evaluate_generator(dataset_url: str = None, *, cat: StrayCat) -> str:
         judging_llm = LangchainLLMWrapper(langchain_llm)
 
         # Wrap the Cat's embedder for Ragas
-        embedder = LangchainEmbeddingsWrapper(cat.embedder.langchain_embeddings)
+        embedder = LangchainEmbeddingsWrapper(cat.embedder)
 
         metrics_to_evaluate = [
             Faithfulness(llm=judging_llm),
